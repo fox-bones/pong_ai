@@ -1,4 +1,7 @@
 use macroquad::prelude::*;
+use pong::ball::Ball;
+use pong::paddle::Paddle;
+use pong::sim::{Side, Sim};
 
 pub struct Star {
     pos: Vec2,
@@ -120,26 +123,46 @@ pub fn draw_divider() {
     draw_rectangle(screen_width() / 2.0, 0.0, 1.0, screen_height(), GRAY);
 }
 
-pub fn select_difficulty(difficulty: &str) {
-    let difficulty_dims = measure_text("Select Difficulty", None, 48, 1.0);
-    let easy_dims = measure_text("Easy", None, 28, 1.0);
-    let hard_dims = measure_text("Hard", None, 28, 1.0);
+/// Draws the court: divider, both paddles, the ball, and the score.
+pub fn draw_match(sim: &Sim) {
+    draw_divider();
+    draw_paddle(sim.get_paddle(Side::Left));
+    draw_paddle(sim.get_paddle(Side::Right));
+    draw_ball(sim.get_ball());
+    draw_score_overlay(sim.get_score(Side::Left), sim.get_score(Side::Right));
+}
 
-    let easy_x = (screen_width() / 2.0) - (difficulty_dims.width / 4.0) - (easy_dims.width / 2.0);
-    let hard_x = (screen_width() / 2.0) + (difficulty_dims.width / 4.0) - (hard_dims.width / 2.0);
+fn draw_paddle(paddle: &Paddle) {
+    let position = paddle.get_position();
+    draw_rectangle(position.x, position.y, Paddle::WIDTH, Paddle::HEIGHT, GREEN);
+}
+
+fn draw_ball(ball: &Ball) {
+    let position = ball.get_position();
+    draw_circle(position.x, position.y, Ball::RADIUS, GREEN);
+}
+
+/// Draws the options spaced evenly under the title, with a blinking arrow at the selected one.
+pub fn select_difficulty(options: &[&str], selected: usize) {
+    let difficulty_dims = measure_text("Select Difficulty", None, 48, 1.0);
+    let spacing = difficulty_dims.width / 3.0;
+    let middle = (options.len() - 1) as f32 / 2.0;
     let show_arrow = get_time() % 1.0 < 0.5;
 
     draw_centered_text("Select Difficulty", 230.0, 48.0, YELLOW);
-    draw_text("Easy", easy_x, 270.0, 28.0, WHITE);
-    draw_text("Hard", hard_x, 270.0, 28.0, WHITE);
 
-    if show_arrow {
-        let arrow_x = if difficulty == "easy" { easy_x } else { hard_x };
-        draw_text(">", arrow_x - 20.0, 270.0, 28.0, WHITE);
+    for (i, option) in options.iter().enumerate() {
+        let option_dims = measure_text(option, None, 28, 1.0);
+        let x = (screen_width() / 2.0) + (i as f32 - middle) * spacing - (option_dims.width / 2.0);
+        draw_text(option, x, 270.0, 28.0, WHITE);
+
+        if show_arrow && i == selected {
+            draw_text(">", x - 20.0, 270.0, 28.0, WHITE);
+        }
     }
 }
 
-pub fn draw_score_overlay(player_score: i32, opponent_score: i32) {
+pub fn draw_score_overlay(player_score: u32, opponent_score: u32) {
     let text = format!("{}     {}", player_score, opponent_score);
     let size = 42.0;
     let dimensions = measure_text(&text, None, size as u16, 1.0);
@@ -153,12 +176,12 @@ pub fn draw_score_overlay(player_score: i32, opponent_score: i32) {
     );
 }
 
-pub fn flash_point_screen(side: &str) {
+pub fn flash_point_screen(side: Side) {
     let text = "+1";
     let size = 56.0;
     let dimensions = measure_text(text, None, size as u16, 1.0);
 
-    let (dim_x, highlight_x, text_x) = if side == "opponent" {
+    let (dim_x, highlight_x, text_x) = if side == Side::Right {
         (0.0, screen_width() / 2.0, screen_width() * 0.75)
     } else {
         (screen_width() / 2.0, 0.0, screen_width() * 0.25)
@@ -169,10 +192,9 @@ pub fn flash_point_screen(side: &str) {
     draw_text(text, text_x - dimensions.width / 2.0, screen_height() / 2.0, size, WHITE);
 }
 
-pub fn draw_end_menu(winner: &str) {
+pub fn draw_end_menu(title: &str) {
     draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.0, 0.0, 0.6));
 
-    let title = if winner == "player" { "Player Won" } else { "Opponent Won" };
     draw_centered_text(title, 210.0, 48.0, YELLOW);
     draw_centered_text("Enter - Restart", 250.0, 28.0, WHITE);
     draw_centered_text("Q - Main Menu", 290.0, 28.0, WHITE);

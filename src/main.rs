@@ -1,25 +1,30 @@
-pub mod ball;
-pub mod opponent;
-pub mod player;
-pub mod ui;
+mod ui;
 
-use crate::ball::*;
-use crate::opponent::*;
-use crate::player::*;
 use crate::ui::*;
-use ::rand::Rng;
 use macroquad::audio::{Sound, load_sound, play_sound, stop_sound, play_sound_once, PlaySoundParams};
 use macroquad::prelude::*;
+use pong::brain::Brain;
+use pong::controller::{Bot, Controller, Observation, REACTION_TIME};
+use pong::paddle::Direction;
+use pong::sim::{COURT_HEIGHT, COURT_WIDTH, DT, Side, Sim};
 
 fn window_conf() -> Conf {
     Conf {
         window_title: "Pong".to_owned(),
-        window_width: 640,
-        window_height: 480,
+        window_width: COURT_WIDTH as i32,
+        window_height: COURT_HEIGHT as i32,
         window_resizable: false,
         ..Default::default()
     }
 }
+
+/// Most time the sim catches up on in one frame, so a stall (like dragging the
+/// window) doesn't fast-forward the match.
+const MAX_FRAME_TIME: f32 = 0.1;
+
+/// Easy is the same trained bot with slower reactions (Hard and Watch use `REACTION_TIME`,
+/// the speed it trained at). Raise this to make Easy easier.
+const EASY_REACTION_TIME: f32 = 0.45;
 
 enum GameState {
     StartMenu,
@@ -29,24 +34,67 @@ enum GameState {
     End,
 }
 
-fn reset_game(player: &mut Player, opponent: &mut Opponent, ball: &mut Ball) {
-    let mut rng = ::rand::thread_rng();
-    player.set_start_position();
-    opponent.set_start_position();
-    if rng.gen_range(0..2) == 0 {
-        ball.serve_player();
-    } else {
-        ball.serve_opponent();
+/// The choices on the difficulty menu.
+#[derive(Clone, Copy)]
+enum Mode {
+    Easy,
+    Hard,
+    /// The trained bot plays itself.
+    Watch,
+}
+
+impl Mode {
+    const ALL: [Mode; 3] = [Mode::Easy, Mode::Hard, Mode::Watch];
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Easy => "Easy",
+            Mode::Hard => "Hard",
+            Mode::Watch => "Watch",
+        }
     }
+}
+
+/// The human player: the arrow keys move the paddle.
+struct KeyboardController;
+
+impl Controller for KeyboardController {
+    fn act(&mut self, _observation: &Observation) -> Direction {
+        if is_key_down(KeyCode::Up) {
+            Direction::Up
+        } else if is_key_down(KeyCode::Down) {
+            Direction::Down
+        } else {
+            Direction::None
+        }
+    }
+}
+
+/// The left and right paddles' controllers for a mode.
+fn controllers(mode: Mode, brain: &Brain) -> (Box<dyn Controller>, Box<dyn Controller>) {
+    match mode {
+        Mode::Easy => (Box::new(KeyboardController), Box::new(Bot::new(brain.clone(), EASY_REACTION_TIME))),
+        Mode::Hard => (Box::new(KeyboardController), Box::new(Bot::new(brain.clone(), REACTION_TIME))),
+        Mode::Watch => (Box::new(Bot::new(brain.clone(), REACTION_TIME)), Box::new(Bot::new(brain.clone(), REACTION_TIME))),
+    }
+}
+
+/// Loads the brain saved by the trainer.
+async fn load_brain(path: &str) -> Brain {
+    let text = load_string(path).await.unwrap_or_else(|_| {
+        panic!("{path} is missing; train the bot with `cargo run --release --bin train`")
+    });
+    Brain::from_text(&text).unwrap_or_else(|err| panic!("{path}: {err}"))
 }
 
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut game_state = GameState::StartMenu;
-    let mut difficulty_selection: &str = "easy";
+    let mut selected_mode: usize = 0;
+    let mut mode = Mode::Easy;
     let mut menu_music_playing: bool = false;
 
-    // Macroquad sound library 
+    // Macroquad sound library
     let player_paddle_hit_sound: Sound = load_sound("resources/paddle_hit_2.wav").await.unwrap();
     let opponent_paddle_hit_sound: Sound = load_sound("resources/paddle_hit.wav").await.unwrap();
     let ui_selection_sound: Sound = load_sound("resources/ui_selection.wav").await.unwrap();
@@ -56,21 +104,14 @@ async fn main() {
 
     let mut stars: Vec<Star> = (0..200).map(|_| create_star()).collect();
 
-    let mut player = Player::new();
-    let mut opponent = Opponent::new();
-    let mut ball = Ball::new();
+    let brain = load_brain("resources/brains/champion.txt").await;
 
-    let mut player_score: i32 = 0;
-    let mut opponent_score: i32 = 0;
+    // The player is on the left, the opponent on the right.
+    let mut sim = Sim::new(::rand::random());
+    let (mut left, mut right) = controllers(mode, &brain);
 
-    const WINNING_SCORE: i32 = 11;
-    const POINT_FLASH_SECONDS: f64 = 1.0;
-
-    let mut ball_paused_velocity = ball.get_velocity();
-    let mut point_flash_ends_at: f64 = 0.0;
-    let mut point_scored_by = "player";
-    let mut serve_to_player = false;
-    let mut waiting_to_serve = false;
+    // Frame time the sim hasn't caught up on yet; it only advances in whole DT steps.
+    let mut unsimulated_time: f32 = 0.0;
 
     loop {
         clear_background(BLACK);
@@ -86,10 +127,7 @@ async fn main() {
                 }
 
                 if is_key_pressed(KeyCode::Enter) {
-                    player_score = 0;
-                    opponent_score = 0;
-                    waiting_to_serve = false;
-                    reset_game(&mut player, &mut opponent, &mut ball);
+                    sim.reset();
                     game_state = GameState::DifficultyMenu;
                 }
             }
@@ -98,116 +136,63 @@ async fn main() {
 
                 if is_key_pressed(KeyCode::Right) {
                     play_sound_once(&ui_selection_sound);
-                    difficulty_selection = "hard";
+                    selected_mode = (selected_mode + 1).min(Mode::ALL.len() - 1);
                 }
                 if is_key_pressed(KeyCode::Left) {
                     play_sound_once(&ui_selection_sound);
-                    difficulty_selection = "easy";
+                    selected_mode = selected_mode.saturating_sub(1);
                 }
                 if is_key_pressed(KeyCode::Enter) {
-                    match difficulty_selection {
-                        "easy" => opponent.set_difficulty(0.35),
-                        "hard" => opponent.set_difficulty(0.7),
-                        _ => {}
-                    }
+                    mode = Mode::ALL[selected_mode];
+                    (left, right) = controllers(mode, &brain);
                     game_state = GameState::Playing;
                 }
                 if is_key_pressed(KeyCode::Escape) {
                     game_state = GameState::StartMenu;
                 }
 
-                ui::select_difficulty(difficulty_selection);
+                ui::select_difficulty(&Mode::ALL.map(Mode::label), selected_mode);
             }
             GameState::Playing => {
-                ui::draw_divider();
                 stop_sound(&menu_music);
                 menu_music_playing = false;
 
-                player.keyboard_movement();
-                player.update_position();
-                player.draw();
+                unsimulated_time += get_frame_time().min(MAX_FRAME_TIME);
+                while unsimulated_time >= DT {
+                    unsimulated_time -= DT;
 
-                opponent.automatic_movement(&ball);
-                opponent.update_position();
-                opponent.draw();
+                    let left_move = left.act(&sim.observe(Side::Left));
+                    let right_move = right.act(&sim.observe(Side::Right));
+                    let events = sim.step(left_move, right_move);
 
-                // Serve timer — wait for flash to finish before serving
-                if waiting_to_serve && get_time() >= point_flash_ends_at {
-                    if serve_to_player {
-                        ball.serve_player();
-                    } else {
-                        ball.serve_opponent();
+                    match events.paddle_hit {
+                        Some(Side::Left) => play_sound_once(&player_paddle_hit_sound),
+                        Some(Side::Right) => play_sound_once(&opponent_paddle_hit_sound),
+                        None => {}
                     }
-                    waiting_to_serve = false;
+                    match events.point {
+                        Some(Side::Left) => play_sound_once(&player_scores_point_sound),
+                        Some(Side::Right) => play_sound_once(&player_loses_point_sound),
+                        None => {}
+                    }
                 }
 
-                ball.update();
-
-                if !waiting_to_serve {
-                    ball.check_wall_collision();
-                    ball.check_player_collision(&player, &player_paddle_hit_sound);
-                    ball.check_opponent_collision(&opponent, &opponent_paddle_hit_sound);
+                ui::draw_match(&sim);
+                if let Some(scorer) = sim.get_point_scorer() {
+                    ui::flash_point_screen(scorer);
                 }
 
-                ball.draw();
-                ui::draw_score_overlay(player_score, opponent_score);
-
-                if waiting_to_serve {
-                    ui::flash_point_screen(point_scored_by);
-                }
-
-                if is_key_pressed(KeyCode::Escape) {
-                    ball_paused_velocity = ball.get_velocity();
+                if sim.get_winner().is_some() {
+                    game_state = GameState::End;
+                } else if is_key_pressed(KeyCode::Escape) {
                     game_state = GameState::Paused;
-                }
-
-                let ball_x = ball.get_position().x;
-                if !waiting_to_serve && ball_x < 0.0 {
-                    play_sound_once(&player_loses_point_sound);
-                    opponent_score += 1;
-                    if opponent_score >= WINNING_SCORE {
-                        game_state = GameState::End;
-                    } else {
-                        point_scored_by = "opponent";
-                        serve_to_player = true;
-                        point_flash_ends_at = get_time() + POINT_FLASH_SECONDS;
-                        waiting_to_serve = true;
-                    }
-                } else if !waiting_to_serve && ball_x > screen_width() {
-                    play_sound_once(&player_scores_point_sound);
-                    player_score += 1;
-                    if player_score >= WINNING_SCORE {
-                        game_state = GameState::End;
-                    } else {
-                        point_scored_by = "player";
-                        serve_to_player = false;
-                        point_flash_ends_at = get_time() + POINT_FLASH_SECONDS;
-                        waiting_to_serve = true;
-                    }
                 }
             }
             GameState::Paused => {
-                ui::draw_divider();
-
-                player.set_direction("None");
-                player.update_position();
-                player.draw();
-
-                opponent.set_direction("None");
-                opponent.update_position();
-                opponent.draw();
-
-                ball.set_velocity_x(0.0);
-                ball.set_velocity_y(0.0);
-                ball.update();
-                ball.draw();
-
-                ui::draw_score_overlay(player_score, opponent_score);
+                ui::draw_match(&sim);
                 ui::draw_pause_menu();
 
                 if is_key_pressed(KeyCode::Escape) {
-                    ball.set_velocity_x(ball_paused_velocity.x);
-                    ball.set_velocity_y(ball_paused_velocity.y);
                     game_state = GameState::Playing;
                 }
                 if is_key_pressed(KeyCode::Q) {
@@ -217,22 +202,23 @@ async fn main() {
             GameState::End => {
                 ui::update_stars(&mut stars, StarDirection::DiagonalReverse);
 
-                if player_score >= WINNING_SCORE {
-                    ui::draw_end_menu("player");
-                } else {
-                    ui::draw_end_menu("opponent");
+                if let Some(winner) = sim.get_winner() {
+                    let title = match (mode, winner) {
+                        (Mode::Watch, Side::Left) => "Left Won",
+                        (Mode::Watch, Side::Right) => "Right Won",
+                        (_, Side::Left) => "Player Won",
+                        (_, Side::Right) => "Opponent Won",
+                    };
+                    ui::draw_end_menu(title);
                 }
 
                 if is_key_pressed(KeyCode::Enter) {
-                    player_score = 0;
-                    opponent_score = 0;
-                    waiting_to_serve = false;
-                    reset_game(&mut player, &mut opponent, &mut ball);
+                    sim.reset();
+                    left.reset();
+                    right.reset();
                     game_state = GameState::Playing;
                 }
                 if is_key_pressed(KeyCode::Q) {
-                    player_score = 0;
-                    opponent_score = 0;
                     game_state = GameState::StartMenu;
                 }
             }
